@@ -1,0 +1,157 @@
+// per la gestione delle allucinazioni
+
+Idea chiave: separare 3 problemi
+
+Invece di chiedere al VLM “fai tutto tu”, separiamo:
+
+Capire se l’oggetto è visibile ora
+
+Decidere dove cercarlo se non è visibile
+
+Pianificare le azioni di manipolazione sui soli oggetti che sappiamo esistere
+
+E usiamo il VLM per 1 e 2 (ragionamento), mentre noi mettiamo dei vincoli minimi sulla 3, in modo da bloccare le allucinazioni “pericolose” (tipo pick di oggetti inesistenti), ma senza fissare scenari rigidi.
+
+1. Step “È visibile o no?” invece di liste dure
+
+Invece di passargli una lista di tutti gli oggetti e dirgli “puoi usare solo questi nomi”, facciamo una cosa più flessibile:
+
+L’utente dice: “put the red mug into the microwave”.
+
+Prima di pianificare, facciamo una query specifica al VLM:
+
+You see the current image of the scene.
+
+Question: Is there at least one red mug visible in this image?
+Answer with a single token: "yes" or "no".
+
+
+Se risponde "yes" → gli lasciamo pianificare liberamente un piano di pick&place sulla “red mug”.
+
+Se risponde "no" → non gli permettiamo di pianificare un pick diretto; invece gli chiediamo esplicitamente un piano di ricerca.
+
+In codice (schematico):
+
+def is_target_visible(vlm, image, target_description: str) -> bool:
+    # prompt molto ristretto yes/no
+    ...
+
+def plan_with_visibility_guard(vlm, image, goal: str, history):
+    visible = is_target_visible(vlm, image, target_description=goal)
+    if visible:
+        # chiedi un piano di manipolazione "normale"
+        return plan_pick_and_place(vlm, image, goal, history)
+    else:
+        # chiedi un piano di ricerca
+        return plan_search(vlm, image, goal, history)
+
+
+Questo è molto simile a ciò che fanno in ViLa quando la stapler non si vede: prima guardano l’immagine del cassetto aperto, se “non c’è”, pianificano di cercare altrove. 
+arXiv
+
+Vantaggio:
+non devi mantenere liste di 50 oggetti; affidi al VLM solo una domanda estremamente semplice (yes/no) dove è molto più affidabile che in un piano lungo.
+
+2. Pianificare la ricerca invece che allucinare
+
+Se lo step 1 dice “no, non si vede”, invece di lasciarlo inventare una red mug da qualche parte, gli dai un compito diverso:
+
+“Non vedi nessuna red mug nell’immagine corrente.
+Pianifica una sequenza di azioni per cercarla nei posti più probabili (es. cupboard, drawer, fridge, …).”
+
+Prompt del tipo:
+
+You are controlling a kitchen robot.
+
+The user wants: "Put the red mug into the microwave."
+
+From the current camera view, there is NO red mug visible.
+
+You know that mugs are often stored in places such as:
+- upper cabinet
+- lower cabinet
+- dish rack
+- sink
+- drawer
+
+Plan a sequence of high-level actions to search for the red mug.
+Use primitives: open, close, navigate, inspect, etc.
+
+Output ONLY a JSON plan with steps like:
+- open cabinet
+- inspect inside cabinet
+- if not found, navigate to another storage, open, inspect, ...
+
+Do NOT assume the mug exists in the current view.
+
+
+Così ottieni piani tipo:
+
+{
+  "plan": [
+    {"step_id": 1, "primitive": "navigate", "destination": "upper_cabinet"},
+    {"step_id": 2, "primitive": "open", "object": "upper_cabinet_door"},
+    {"step_id": 3, "primitive": "inspect", "location": "upper_cabinet_interior"},
+    {"step_id": 4, "primitive": "navigate", "destination": "lower_cabinet"},
+    ...
+  ]
+}
+
+
+E ogni volta che apri un nuovo posto, fai un nuovo frame, rifai lo step 1 (“ora il target è visibile?”). Quando finalmente è yes, passi al piano di manipolazione.
+
+È esattamente il comportamento “look before you leap” del paper: guardo, se non trovo, continuo a cercare altrove con feedback visivo. 
+arXiv
+
+3. Vincoli minimi sulle azioni (niente liste gigantesche)
+
+Per evitare che il VLM faccia pick(red_mug) quando il check dice “non visibile”, non serve una lista di tutti gli oggetti; basta una logica di validazione molto semplice:
+
+mantieni una variabile target_visible: bool
+
+quando esegui il piano:
+
+se primitive == "pick" e target_visible == False, rifiuti l’azione (e chiedi un nuovo piano al VLM, dicendo che ha violato il vincolo).
+
+Questo si può implementare così:
+
+def execute_plan_step(action, target_visible):
+    if action.primitive == "pick" and not target_visible:
+        raise ValueError("Cannot pick target: it is not currently visible.")
+    # altrimenti esegui / manda all'esecutore di skill
+
+
+E nel re-prompt:
+
+In your previous plan, you tried to pick the red mug even though it is NOT visible
+in the current camera image. This is not allowed.
+
+You must first plan search actions (navigate, open, inspect) until the red mug
+is visible, and only then plan a pick/place sequence.
+
+Regenerate a valid plan.
+
+
+Importante: questo non richiede liste di tutti gli oggetti nella scena; ti basta sapere se il target è visibile o no (check yes/no) e usare un guardrail.
+
+4. Non perdere generalizzazione a scenari nuovi
+
+Per non “fissarti” su uno scenario singolo:
+
+Nel prompt di ricerca non hard-codi “questi 3 cassetti e basta”, ma dai categorie generiche di storage:
+
+“upper cabinet, lower cabinet, drawer, fridge, pantry…”
+
+In RoboCasa/Franka reale, puoi mappare queste categorie a posti concreti:
+
+upper cabinet → un certo link/pose nel simulatore
+
+fridge → un certo frame nel mondo reale
+
+Quindi:
+
+stessa logica di pianificazione in tutti gli scenari,
+
+cambiano solo le mappature container → coordinate/skill (che comunque devi modellare per controllare il robot).
+
+Se un giorno aggiungi un nuovo ambiente con un “pantry”, non devi rifare liste di oggetti: ti basta aggiungere una mappatura in basso livello.
