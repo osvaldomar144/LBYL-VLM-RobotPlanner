@@ -2,74 +2,63 @@
 
 from typing import List, Dict, Any
 
-
+# Definiamo lo schema JSON che la VLM deve rispettare
 PLAN_SCHEMA_STR = r"""
 You must output a JSON object with the following structure:
 
 {
   "plan": [
     {
-      "step_id": 1,
-      "primitive": "pick",
-      "object": "mug",
-      "from_location": "sink"
-    },
-    {
-      "step_id": 2,
-      "primitive": "place",
-      "object": "mug",
-      "to_location": "microwave_interior"
+      "primitive": "base",
+      "params": [0.8, 0, 0],
+      "reasoning": "Moving closer to the counter"
     }
   ]
 }
 
-- "primitive" MUST be one of: "pick", "place", "open", "close",
-  "press_button", "turn_knob", "navigate".
-- step_id MUST start from 1 and increase by 1 for each step.
-- Only include fields that are necessary for the action.
-- Do NOT include any explanation outside the JSON.
+COMMAND RULES:
+1. "base": params [vx, vy, w]. Range -1.0 to 1.0.
+   - Use [1, 0, 0] to move FORWARD.
+   - Use [-1, 0, 0] to move BACKWARD.
+   - Use [0, 0, 1] to ROTATE left.
+2. "arm": params [x, y, z]. Range -1.0 to 1.0. 
+   - These are DELTA movements relative to current hand position.
+   - [1, 0, 0] is Forward (away from robot).
+   - [0, 0, 1] is Up.
+   - [0, 0, -1] is Down.
+3. "torso": params [velocity]. Range -1.0 to 1.0.
+   - [1.0] to go UP, [-1.0] to go DOWN.
+4. "gripper": params [1.0] (CLOSE) or [-1.0] (OPEN).
+
+Output ONLY the JSON. No preamble.
 """
 
-
-def build_system_prompt(available_primitives: List[str]) -> str:
-    primitives_str = ", ".join(f'"{p}"' for p in available_primitives)
+def build_system_prompt() -> str:
     return (
-        "You are a robotic task planner operating in a kitchen environment. "
-        "You see an image of the current scene. Your job is to produce a "
-        "sequence of high-level actions (a plan) that a robot can execute.\n\n"
-        f"The robot can ONLY use the following primitives: {primitives_str}.\n\n"
+        "You are a Robot Pilot operating a mobile manipulator (Panda arm on wheels).\n"
+        "You receive an image of what the robot sees.\n"
+        "Your goal is to guide the robot continuously towards the objective.\n\n"
+        "CONTROL STRATEGY:\n"
+        "- If the target is far away or not reachable: use 'base' to navigate or 'torso' to adjust height.\n"
+        "- If the target is within reach: use 'arm' to align the hand and approach it.\n"
+        "- Use small steps. You will be called again in the next frame to correct the trajectory.\n"
+        "- If you need to grasp: align the gripper above/around the object, lower the arm, then close gripper.\n\n"
         + PLAN_SCHEMA_STR
     )
 
-
-def history_to_text(history: List[Dict[str, Any]]) -> str:
+def build_user_prompt(goal_instruction: str, current_state: dict) -> str:
     """
-    history: lista di dict del tipo:
-      { "step_id": int, "primitive": "...", "object": "...", "result": "success/failed" }
+    Costruisce il prompt utente con lo stato attuale del robot.
     """
-    if not history:
-        return "No actions have been executed yet."
-    lines = []
-    for h in history:
-        desc = f"step {h['step_id']}: {h['primitive']}"
-        if h.get("object"):
-            desc += f" (object={h['object']})"
-        if h.get("result"):
-            desc += f" -> result={h['result']}"
-        lines.append(desc)
-    return "\n".join(lines)
-
-
-def build_user_prompt(goal_instruction: str,
-                      history: List[Dict[str, Any]]) -> str:
-    history_str = history_to_text(history)
+    # Formattiamo lo stato per aiutare la VLM (soprattutto per la depth estimation)
+    pos_str = f"[{current_state['eef_xyz'][0]}, {current_state['eef_xyz'][1]}, {current_state['eef_xyz'][2]}]"
+    
     return (
-        "High-level instruction from the user:\n"
-        f"{goal_instruction}\n\n"
-        "Actions already executed so far:\n"
-        f"{history_str}\n\n"
-        "Look carefully at the provided image of the current scene and reason step by step "
-        "about what the robot should do next to achieve the goal from the current state.\n\n"
-        "Then, output ONLY a JSON object describing a COMPLETE plan from now until the goal "
-        "is accomplished, following exactly the required JSON schema."
+        f"GOAL: {goal_instruction}\n\n"
+        f"CURRENT ROBOT STATE:\n"
+        f"- EEF Position (XYZ): {pos_str}\n"
+        f"- Gripper State: {current_state['gripper']}\n"
+        f"- Safety Warning: {current_state['safety_warning']}\n\n"
+        "Look at the image. Determine the immediate NEXT MOVE to progress towards the goal.\n"
+        "Output the JSON plan."
     )
