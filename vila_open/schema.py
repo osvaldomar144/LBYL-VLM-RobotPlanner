@@ -1,45 +1,32 @@
 # vila_open/schema.py
 
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional, Union
 import json
-
 
 @dataclass
 class Action:
     """
-    Azione simbolica di alto livello (stile ViLa).
+    Azione 'Pilota' per il controllo diretto tramite robot_vlm_lib.
     """
-    step_id: int
-    primitive: str               # es: "pick", "place", "open", ...
-    object: Optional[str] = None
-    from_location: Optional[str] = None
-    to_location: Optional[str] = None
-
-    # conterrà campi extra come "destination", "button", "knob_id", ecc.
-    extra_args: Optional[Dict[str, Any]] = None
+    primitive: str          # "base", "arm", "torso", "gripper"
+    params: List[float]     # es: [0.5, 0, 0] oppure [1.0]
+    
+    # Campo opzionale per farci dire dalla VLM cosa sta cercando di fare (Reasoning)
+    reasoning: Optional[str] = None 
 
     def to_dict(self) -> Dict[str, Any]:
-        # campi base
-        base = {
-            "step_id": self.step_id,
+        return {
             "primitive": self.primitive,
-            "object": self.object,
-            "from_location": self.from_location,
-            "to_location": self.to_location,
+            "params": self.params,
+            "reasoning": self.reasoning
         }
-        # aggiungi gli argomenti extra (es. destination, button...)
-        if self.extra_args:
-            base.update(self.extra_args)
-
-        # rimuovi i None
-        return {k: v for k, v in base.items() if v is not None}
-
 
 @dataclass
 class Plan:
     """
-    Piano = lista ordinata di azioni.
+    In modalità Pilota, il 'Plan' è solitamente composto da UNA sola azione immediata,
+    perché la VLM ricalcola tutto al frame successivo.
     """
     plan: List[Action]
 
@@ -53,27 +40,18 @@ class Plan:
     def from_dict(d: Dict[str, Any]) -> "Plan":
         actions: List[Action] = []
         for a in d.get("plan", []):
-            # campi noti
-            step_id = a.get("step_id")
             primitive = a.get("primitive")
-            obj = a.get("object")
-            from_loc = a.get("from_location")
-            to_loc = a.get("to_location")
+            params = a.get("params")
+            reasoning = a.get("reasoning")
+            
+            # Gestione robusta dei parametri (es. se la VLM manda stringhe per il gripper)
+            if primitive == "gripper" and isinstance(params, list):
+                if params[0] == "close": params = [1.0]
+                elif params[0] == "open": params = [-1.0]
 
-            # tutto ciò che non è tra i campi noti va in extra_args
-            known_keys = {"step_id", "primitive", "object", "from_location", "to_location"}
-            extra = {k: v for k, v in a.items() if k not in known_keys}
-
-            actions.append(
-                Action(
-                    step_id=step_id,
-                    primitive=primitive,
-                    object=obj,
-                    from_location=from_loc,
-                    to_location=to_loc,
-                    extra_args=extra if extra else None,
-                )
-            )
+            if primitive and params is not None:
+                actions.append(Action(primitive=primitive, params=params, reasoning=reasoning))
+        
         return Plan(plan=actions)
 
     @staticmethod
