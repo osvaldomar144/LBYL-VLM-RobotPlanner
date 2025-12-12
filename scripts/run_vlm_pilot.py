@@ -8,127 +8,149 @@ import sys
 import os
 from PIL import Image
 
-# --- GESTIONE DEI PATH (IMPORTANTE) ---
-# Otteniamo il percorso assoluto della cartella corrente (scripts/)
+# ... (Gestione Path invariata) ...
 current_dir = os.path.dirname(os.path.abspath(__file__))
-# Otteniamo il percorso della cartella padre (LBYL-VLM-RobotPlanner/)
 project_root = os.path.dirname(current_dir)
+if project_root not in sys.path: sys.path.append(project_root)
+if current_dir not in sys.path: sys.path.append(current_dir)
 
-# Aggiungiamo la root al sys.path così Python può trovare "vila_open"
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
-# Aggiungiamo anche la cartella corrente per sicurezza (per robot_vlm_lib)
-if current_dir not in sys.path:
-    sys.path.append(current_dir)
-
-# --- ORA POSSIAMO IMPORTARE TUTTO ---
-
-# 1. Importiamo la libreria Robot (che è nella stessa cartella 'scripts')
 try:
     from robot_vlm_lib import VLMRobotInterface
 except ImportError:
-    # Fallback nel caso Python faccia i capricci coi path relativi
     from scripts.robot_vlm_lib import VLMRobotInterface
 
-# 2. Importiamo i moduli VLM (che sono nella cartella 'vila_open')
 try:
     from vila_open.vlm_client import VLMClient, VLMConfig
     from vila_open.planning_loop import plan_next_step
-except ImportError as e:
-    print(f"\n[ERRORE IMPORT] Non riesco a trovare 'vila_open'.")
-    print(f"Assicurati di lanciare lo script dalla root del progetto oppure che la struttura sia corretta.")
-    print(f"Path corrente analizzato: {sys.path}\n")
-    raise e
+except ImportError:
+    print("ERRORE: Impossibile importare vila_open.")
+    sys.exit(1)
 
 def numpy_img_to_pil(np_img):
-    """Converte immagine (H,W,3) Numpy -> PIL Image"""
     return Image.fromarray(np_img)
+
+def update_visual_monitor(img_np, step_name="Init"):
+    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    cv2.imshow("VLM Dual-Eye Monitor", img_bgr)
+    cv2.waitKey(1)
+    filename = f"live_view_{step_name}.png"
+    cv2.imwrite(filename, img_bgr)
+    return filename
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--env_name", type=str, default="PnPCounterToCab")
-    parser.add_argument("--goal", type=str, default="Pick the apple and place it in the shelf")
     parser.add_argument("--max_steps", type=int, default=100)
     args = parser.parse_args()
 
-    print("--- VLM ROBOT PILOT: INITIALIZING ---")
-
-    # 1. Inizializzazione VLM Client
-    print("[System] Loading VLM (LLaVA-OneVision)...")
-    # Nota: Assicurati di avere memoria GPU a sufficienza. 
-    # Se crasha per OOM, riduci max_new_tokens o usa device="cpu" (lento) per debug.
-    vlm_config = VLMConfig(device="cuda", max_new_tokens=256, verbose=False)
+    print("--- VLM ROBOT PILOT: DUAL CAMERA VERSION ---")
+    
+    # Token alti per sicurezza
+    vlm_config = VLMConfig(device="cuda", max_new_tokens=1024, verbose=False)
     vlm_client = VLMClient(vlm_config)
 
-    # 2. Inizializzazione Robot (Libreria Nostra)
-    print(f"[System] Loading Robot Environment ({args.env_name})...")
-    # render=True apre la finestra MuJoCo
+    print(f"[System] Loading Robot ({args.env_name})...")
     robot = VLMRobotInterface(env_name=args.env_name, render=True)
 
-    print(f"\n[Mission] GOAL: \"{args.goal}\"")
-    print("[Mission] Start Pilot Loop...")
+    # =========================================================================
+    # FASE 1: DUAL VIEW SETUP
+    # =========================================================================
+    print("\n[Phase 1] Initializing Dual Views...")
+    text_info, visual_dict = robot.get_context()
+    
+    # Recuperiamo entrambe le camere
+    img_global = visual_dict.get('robot0_agentview_center')
+    img_local = visual_dict.get('robot0_eye_in_hand')
+    
+    if img_global is None or img_local is None:
+        print("[Error] Una delle due camere manca! Verifica robot_vlm_lib.py")
+        robot.close()
+        return
+
+    # Uniamo le immagini affiancate (Stitching orizzontale)
+    # Sinistra: Globale | Destra: Mano
+    dual_view_img = np.hstack((img_global, img_local))
+
+    update_visual_monitor(dual_view_img, step_name="00_START")
+    
+    print("---------------------------------------------------------------")
+    print(" VEDI DUE IMMAGINI: SX=Globale, DX=Mano.")
+    print("---------------------------------------------------------------")
+    
+    try:
+        user_goal = input("INSERT GOAL > ").strip()
+        if not user_goal: user_goal = "Look around"
+    except EOFError: return
+
+    print(f"\n[Mission Start] GOAL: \"{user_goal}\"")
+    
+    last_action_report = "None (Start of mission)"
 
     try:
         for step in range(args.max_steps):
             print(f"\n--- STEP {step+1}/{args.max_steps} ---")
             
-            # A. LOOK (Prendi contesto dalla libreria)
             text_info, visual_dict = robot.get_context()
+            img_global = visual_dict.get('robot0_agentview_center')
+            img_local = visual_dict.get('robot0_eye_in_hand')
             
-            # Selezione Camera:
-            # - 'robot0_agentview_center' vede tutto il robot e il tavolo (buono per navigazione)
-            # - 'robot0_eye_in_hand' vede solo davanti alla mano (buono per grasp finale)
-            # Per ora usiamo quella globale che è più sicura per iniziare
-            main_camera = 'robot0_agentview_center' 
-            np_image = visual_dict.get(main_camera)
+            if img_global is None: break
             
-            if np_image is None:
-                print(f"[Error] Immagine da {main_camera} non trovata!")
-                break
-                
-            pil_image = numpy_img_to_pil(np_image)
+            # Creazione immagine composita per la VLM
+            dual_view_img = np.hstack((img_global, img_local))
+            
+            update_visual_monitor(dual_view_img, step_name=f"{step+1:02d}")
+            pil_image = numpy_img_to_pil(dual_view_img)
 
-            # B. PLAN (Chiedi alla VLM)
-            print("[Brain] Thinking...")
+            # PLAN
+            print(f"[Brain Input] Context: {last_action_report}")
+            print("[Brain] Thinking...", end="", flush=True)
+            
             plan = plan_next_step(
                 image=pil_image,
-                goal_instruction=args.goal,
+                goal_instruction=user_goal,
                 current_state=text_info,
-                vlm_client=vlm_client
+                vlm_client=vlm_client,
+                last_action_report=last_action_report
             )
+            print(" Done.")
 
-            # C. LEAP (Esegui azione)
             if not plan.plan:
-                print("[Brain] ??? Nessun piano generato (Confusion). Riprovo...")
+                print("[Brain] ??? Confusion. Skip.")
                 continue
 
-            action = plan.plan[0] # Eseguiamo solo la prima azione immediata
-            
-            # Log visivo carino
+            action = plan.plan[0]
             print(f"[Pilot] Action: \033[94m{action.primitive.upper()} {action.params}\033[0m")
             if action.reasoning:
                 print(f"[Pilot] Reason: {action.reasoning}")
 
-            # Esecuzione fisica tramite la tua libreria
+            # LEAP
             result_info = robot.execute_action(action.primitive, action.params)
 
-            # D. FEEDBACK CHECK
-            if result_info.get('safety_warning') != 'nominal':
-                print(f"\033[91m[Safety Alert] {result_info['safety_warning']}\033[0m")
+            # FEEDBACK
+            safety_status = result_info.get('safety_warning', 'nominal')
+            clamped = result_info.get('movement_clamped', False)
             
-            if result_info.get('movement_clamped'):
-                print("\033[93m[Feedback] L'azione è stata rallentata perché il robot sbatteva!\033[0m")
+            if clamped:
+                print(f"\033[91m[Result] BLOCKED! Safety: {safety_status}\033[0m")
+                last_action_report = (
+                    f"CRITICAL FAILURE: Last action ({action.primitive} {action.params}) hit safety limits. "
+                    "Robot is hitting something. Try moving BASE or LIFTING TORSO."
+                )
+            elif safety_status != 'nominal':
+                last_action_report = f"WARNING: Last action caused safety alert ({safety_status}). Be careful."
+            else:
+                last_action_report = f"Last action ({action.primitive}) was SUCCESSFUL."
 
     except KeyboardInterrupt:
-        print("\n[System] Interrupted by user.")
+        print("\n[System] Interrupted.")
     except Exception as e:
         print(f"\n[System] Error: {e}")
         import traceback
         traceback.print_exc()
     finally:
+        cv2.destroyAllWindows()
         robot.close()
-        print("[System] Shutdown.")
 
 if __name__ == "__main__":
     main()
