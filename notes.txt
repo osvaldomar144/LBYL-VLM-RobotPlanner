@@ -155,3 +155,16 @@ stessa logica di pianificazione in tutti gli scenari,
 cambiano solo le mappature container → coordinate/skill (che comunque devi modellare per controllare il robot).
 
 Se un giorno aggiungi un nuovo ambiente con un “pantry”, non devi rifare liste di oggetti: ti basta aggiungere una mappatura in basso livello.
+
+--------------
+
+LBYL-VLM-ROBOTPLANNER/
+|_ scripts/
+|_|_ robot_vlm_lib.py (libreria che ho fatto con le funzioni arm,base,torso,gripper)
+|_|_ run_vlm_pilot.py (script di esecuzione principale)
+|_ vila_open/
+|_|_ __init__.py 
+|_|_ planning_loop.py (si occupa delle iterazioni step by step)
+|_|_ prompts.py (prompt che passo alla vlm)
+|_|_ schema.py (schema delle risposte)
+|_|_ vlm_client.py (configurazione client vlm)
