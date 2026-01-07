@@ -210,3 +210,4 @@ __marimo__/
 dataset_finetuning_v2/images/
 SimplerEnv/
 data/
+checkpoints_franka_platinum/
